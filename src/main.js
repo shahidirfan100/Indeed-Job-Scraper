@@ -2,11 +2,11 @@ import { Actor } from 'apify';
 import { CheerioCrawler, Dataset, log } from 'crawlee';
 import * as cheerio from 'cheerio';
 
-// ——— CONFIG ———
+// ——— CONSTANTS ———
 const BASE_URL = 'https://www.indeed.com';
 const DATE_POSTED_MAP = { '24h': '1', '7d': '7', '30d': '30' };
 
-// Helpers
+// ——— HELPERS ———
 const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
 
 const pickText = ($, selectors) => {
@@ -25,6 +25,17 @@ const pickHtml = ($, selectors) => {
     return null;
 };
 
+const randomDesktopUA = () => {
+    const uas = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    ];
+    return uas[Math.floor(Math.random() * uas.length)];
+};
+
+// ——— MAIN ———
 await Actor.init();
 
 const input = (await Actor.getInput()) || {};
@@ -34,14 +45,14 @@ const {
     posted_date = 'anytime',    // 'anytime' | '24h' | '7d' | '30d'
     max_pages = 5,
     max_items = 200,
-    proxyConfiguration,         // keep existing behavior
+    proxyConfiguration,         // unchanged: wired to Apify proxies via input schema
 } = input;
 
 if (!keyword || !keyword.trim()) {
     throw new Error('Input "keyword" is required.');
 }
 
-// Build initial search URL
+// Build initial search URL (consistent with your runs)
 const startUrl = new URL('/jobs', BASE_URL);
 startUrl.searchParams.set('q', keyword);
 if (location) startUrl.searchParams.set('l', location);
@@ -49,20 +60,23 @@ if (posted_date !== 'anytime' && DATE_POSTED_MAP[posted_date]) {
     startUrl.searchParams.set('fromage', DATE_POSTED_MAP[posted_date]);
 }
 
+// Counters
 let itemCount = 0;
 let pageCount = 0;
 
-// CheerioCrawler (no unsupported hooks)
+// Crawler (Crawlee 3.x–compatible)
 const crawler = new CheerioCrawler({
-    // Anti-block basics compatible with your Crawlee version
     useSessionPool: true,
     persistCookiesPerSession: true,
-    maxRequestRetries: 3,
-    maxConcurrency: 3,
-    requestHandlerTimeoutSecs: 60,
     proxyConfiguration: await Actor.createProxyConfiguration?.(proxyConfiguration),
 
-    // Set realistic headers via header generator (works in Crawlee 3.x)
+    // Gentle defaults; raise once stable
+    maxConcurrency: 2,
+    minConcurrency: 1,
+    maxRequestRetries: 3,
+    requestHandlerTimeoutSecs: 60,
+
+    // Header generator (supported by Crawlee 3.x)
     headerGeneratorOptions: {
         browsers: [
             { name: 'chrome', minVersion: 120, maxVersion: 124 },
@@ -73,12 +87,34 @@ const crawler = new CheerioCrawler({
         operatingSystems: ['windows', 'macos', 'linux'],
     },
 
-    // Main handler
+    // Supported: set headers before each request + small randomized delay
+    preNavigationHooks: [
+        async ({ request, session }) => {
+            const ua = session?.userData?.ua || randomDesktopUA();
+            if (session && !session.userData.ua) session.userData.ua = ua;
+
+            request.headers = {
+                ...request.headers,
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+                'Upgrade-Insecure-Requests': '1',
+                'Referer': 'https://www.google.com/', // helps on list pages
+            };
+
+            // jitter between 800–2200ms to soften bursts
+            const sleepMs = 800 + Math.floor(Math.random() * 1400);
+            await Actor.sleep(sleepMs);
+        },
+    ],
+
     async requestHandler(ctx) {
         const { request, $, response, session, log, crawler } = ctx;
         const { label } = request.userData || {};
 
-        // Early block detection compatible with this API
+        // Early block detection (compatible API)
         const status = response?.statusCode ?? response?.status;
         if (status === 403 || status === 429) {
             log.warning(`Blocked with status ${status} on ${request.url}. Marking session bad.`);
@@ -98,11 +134,13 @@ const crawler = new CheerioCrawler({
             pageCount += 1;
             log.info(`LIST page ${pageCount}: ${request.url}`);
 
-            // Enqueue detail links from job cards
+            // Collect job detail links
             const jobLinks = [];
             $('a.tapItem[href], a[data-jk][href]').each((_, el) => {
                 const href = $(el).attr('href');
                 if (!href) return;
+                // Skip Google ads/sponsored redirects if present
+                if (/^https?:\/\/(www\.)?google\./i.test(href)) return;
                 const abs = new URL(href, BASE_URL).href;
                 jobLinks.push(abs);
             });
@@ -112,7 +150,7 @@ const crawler = new CheerioCrawler({
                 await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
             }
 
-            // Pagination: prefer "Next" button, fallback to ?start=
+            // Pagination: prefer explicit "Next", otherwise bump ?start= by 10
             if (pageCount < max_pages && itemCount < max_items) {
                 const nextSel = 'a[aria-label="Next"], a[data-testid="pagination-page-next"]';
                 const nextHref = $(nextSel).attr('href');
@@ -128,19 +166,18 @@ const crawler = new CheerioCrawler({
             }
 
         } else {
-            // DETAIL PAGE
-
-            // In case $ was not provided for some mime-types, load manually
+            // DETAIL PAGE — ensure we have HTML ($). If not, fetch via Crawlee's client.
             let $$ = $;
             if (!$$) {
-                const body = (await ctx.sendRequest({ // uses underlying http client with same headers/sessions
-                    url: request.url,
-                    responseType: 'text',
-                })).body;
-                $$ = cheerio.load(body);
+                const resp = await ctx.sendRequest({ url: request.url, responseType: 'text' });
+                if (resp.statusCode === 403 || resp.statusCode === 429) {
+                    session?.markBad();
+                    throw new Error(`Blocked ${resp.statusCode} on detail fetch`);
+                }
+                $$ = cheerio.load(resp.body);
             }
 
-            // ——— Field extraction with fallbacks ———
+            // ——— Field extraction with robust fallbacks ———
             const title = pickText($$, [
                 'h1[data-testid="jobsearch-JobTitle"]',
                 'h1.jobsearch-JobInfoHeader-title',
@@ -181,20 +218,18 @@ const crawler = new CheerioCrawler({
 
             const jobTypes = (() => {
                 const types = new Set();
-                // Newer layout (Job details grid)
+                // Primary (newer detail grid)
                 $$('div[data-testid="job-details"] div:contains("Job type")')
                     .next()
                     .find('li')
                     .each((_, li) => types.add(norm($$(li).text())));
-
-                // Generic tokens as fallback
+                // Fallback: scan for common tokens
                 $$('li').each((_, li) => {
                     const t = norm($$(li).text());
                     if (/full[-\s]?time|part[-\s]?time|contract|temporary|internship|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) {
                         types.add(t);
                     }
                 });
-
                 const arr = Array.from(types).filter(Boolean);
                 return arr.length ? arr : null;
             })();
