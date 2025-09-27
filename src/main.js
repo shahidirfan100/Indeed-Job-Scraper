@@ -1,352 +1,396 @@
-// src/main.js — Indeed scraper aligned to your Workable actor’s contract, with anti-403 fallbacks
+// src/main.js — Indeed scraper (HTTP + Cheerio only; Crawlee v3-safe)
+// - RSS bootstrap for discovery (gives posted date via <pubDate>)
+// - Mobile SERP fallback if RSS empty
+// - Detail fetches only /viewjob?jk=... (mobile-first, desktop inline fallback if thin)
+// - Anti-block: conservative concurrency, pacing, session rotation, never touches /rc/clk or /pagead/clk
+// - Outputs: title, company, location, description_html, description_text, date_posted, jobpasted (alias), job_types, url
+
 import { Actor } from 'apify';
-import { CheerioCrawler, Dataset, log, sleep } from 'crawlee';
+import {
+  CheerioCrawler,
+  Dataset,
+  log,
+  sleep,
+  requestAsBrowser, // HTTP fetch (used for RSS bootstrap)
+} from 'crawlee';
 import * as cheerio from 'cheerio';
 
 // ----------------- CONSTANTS -----------------
-const DESKTOP_HOST = 'https://www.indeed.com';
-const MOBILE_HOST  = 'https://m.indeed.com';
-const DATE_MAP     = { '24h': '1', '7d': '7', '30d': '30' };
+const DESKTOP = 'https://www.indeed.com';
+const MOBILE = 'https://m.indeed.com';
+const DATE_MAP = { '24h': '1', '7d': '7', '30d': '30' };
 
-// ----------------- HELPERS -----------------
+// Soft global rate limit across all requests (helps with 403/590 churn)
+const MIN_GAP_MS = 1100;
+let lastHit = 0;
+async function pace() {
+  const now = Date.now();
+  const delta = now - lastHit;
+  if (delta < MIN_GAP_MS) await sleep(MIN_GAP_MS - delta);
+  lastHit = Date.now();
+}
+
 const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
+const rmNoise = ($root) => { $root('script,style,noscript').remove(); };
 
-const stripDomNoise = ($root) => {
-    $root('script, style, noscript').remove();
+// Modest UA pool (desktop & mobile)
+const UAS_DESKTOP = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+];
+const UAS_MOBILE = [
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+];
+const pickUA = (mobile = false) => (mobile ? UAS_MOBILE : UAS_DESKTOP)[Math.floor(Math.random() * (mobile ? UAS_MOBILE.length : UAS_DESKTOP.length))];
+
+const jkFrom = (href) => {
+  try { const u = new URL(href, DESKTOP); return u.searchParams.get('jk'); } catch { return null; }
 };
 
-const randomDesktopUA = () => {
-    const uas = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-    ];
-    return uas[Math.floor(Math.random() * uas.length)];
-};
-
-const pickText = ($, selectors) => {
-    for (const sel of selectors) {
-        const el = $(sel).first();
-        if (el.length) {
-            const txt = norm(el.text());
-            if (txt) return txt;
-        }
+const getText = ($, sels) => {
+  for (const s of sels) {
+    const el = $(s).first();
+    if (el.length) {
+      const txt = norm(el.text());
+      if (txt) return txt;
     }
-    return null;
+  }
+  return null;
 };
-
-const pickHtml = ($, selectors) => {
-    for (const sel of selectors) {
-        const el = $(sel).first();
-        if (el.length) {
-            const html = el.html();
-            if (html && norm(html)) return html.trim();
-        }
+const getHtml = ($, sels) => {
+  for (const s of sels) {
+    const el = $(s).first();
+    if (el.length) {
+      const html = el.html();
+      if (html && norm(html)) return html.trim();
     }
-    return null;
+  }
+  return null;
 };
 
-// Extract jk from any href with /viewjob?jk=...
-const jkFromHref = (href) => {
-    try {
-        const u = new URL(href, DESKTOP_HOST);
-        const jk = u.searchParams.get('jk');
-        return jk || null;
-    } catch {
-        return null;
-    }
+const postedFromDetail = ($) => {
+  const t = norm($('div.jobsearch-JobMetadataFooter, [data-testid="jobsearch-JobMetadataFooter"]').text());
+  if (!t) return null;
+  for (const re of [
+    /(Just posted|Today)/i,
+    /Posted\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+    /\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+    /Active\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+  ]) {
+    const m = t.match(re);
+    if (m) return m[0];
+  }
+  const m2 = t.match(/Posted[^|]+/i);
+  return m2 ? m2[0].trim() : null;
 };
 
-// Read "Posted X days ago / Just posted / Today" ONLY from footer to avoid CSS dumps
-const extractPosted = ($) => {
-    const footerTxt = norm($('div.jobsearch-JobMetadataFooter, [data-testid="jobsearch-JobMetadataFooter"]').text());
-    if (!footerTxt) return null;
+function extractDetail($, url, seed) {
+  rmNoise($);
 
-    const patterns = [
-        /(Just posted|Today)/i,
-        /Posted\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
-        /\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
-        /Active\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
-    ];
-    for (const re of patterns) {
-        const m = footerTxt.match(re);
-        if (m) return m[0];
-    }
-    const m2 = footerTxt.match(/Posted[^|]+/i);
-    return m2 ? m2[0].trim() : null;
-};
+  const title = getText($, [
+    'h1[data-testid="jobsearch-JobTitle"]',
+    'h1.jobsearch-JobInfoHeader-title',
+    'h1',
+    'h1.jobsearch-JobInfoHeader-title-container',
+  ]) ?? seed?.title ?? null;
 
-// Extract all required fields from a DETAIL page
-const extractDetail = ($, url, seed) => {
-    stripDomNoise($);
+  const company = getText($, [
+    '[data-company-name] a',
+    '[data-company-name]',
+    'div[data-testid="inlineHeader-companyName"]',
+    '.jobsearch-CompanyInfoWithoutHeaderImage div a',
+    '.jobsearch-CompanyInfoWithoutHeaderImage div',
+    'div.jobsearch-CompanyInfoContainer a',
+    'div.jobsearch-CompanyInfoContainer',
+  ]) ?? seed?.company ?? null;
 
-    const title = pickText($, [
-        'h1[data-testid="jobsearch-JobTitle"]',
-        'h1.jobsearch-JobInfoHeader-title',
-        'h1',
-        // Mobile fallback
-        'h1.jobsearch-JobInfoHeader-title-container',
-    ]) ?? seed?.title ?? null;
+  const location = getText($, [
+    'div[data-testid="inlineHeader-companyLocation"]',
+    '.jobsearch-CompanyInfoWithoutHeaderImage > div:last-child',
+    'div.jobsearch-CompanyInfoContainer ~ div',
+  ]) ?? seed?.location ?? null;
 
-    const company = pickText($, [
-        '[data-company-name] a',
-        '[data-company-name]',
-        'div[data-testid="inlineHeader-companyName"]',
-        '.jobsearch-CompanyInfoWithoutHeaderImage div a',
-        '.jobsearch-CompanyInfoWithoutHeaderImage div',
-        // Mobile fallback
-        'div.jobsearch-CompanyInfoContainer a',
-        'div.jobsearch-CompanyInfoContainer',
-    ]) ?? seed?.company ?? null;
+  const description_html = getHtml($, [
+    '#jobDescriptionText',
+    'div#jobDescriptionText',
+    'section#jobDescriptionText',
+    '#jobDescriptionTextContainer',
+    'div#jobDescriptionTextContainer',
+  ]);
 
-    const location = pickText($, [
-        'div[data-testid="inlineHeader-companyLocation"]',
-        '.jobsearch-CompanyInfoWithoutHeaderImage > div:last-child',
-        // Mobile fallback
-        'div.jobsearch-CompanyInfoContainer ~ div',
-    ]) ?? seed?.location ?? null;
+  let description_text = null;
+  if (description_html) {
+    const $$ = cheerio.load(description_html);
+    $$('script,style,noscript').remove();
+    description_text = norm($$.text()) || null;
+  } else {
+    description_text = norm($('#jobDescriptionText, section#jobDescriptionText, article, #jobDescriptionTextContainer').text()) || null;
+  }
 
-    const description_html = pickHtml($, [
-        '#jobDescriptionText',
-        'div#jobDescriptionText',
-        'section#jobDescriptionText',
-        // Mobile fallback
-        'div#jobDescriptionTextContainer',
-    ]);
+  const date_posted = postedFromDetail($) ?? seed?.date_posted ?? null;
 
-    let description_text = null;
-    if (description_html) {
-        try {
-            const $$ = cheerio.load(description_html);
-            $$('script, style, noscript').remove();
-            description_text = norm($$.text());
-        } catch {
-            description_text = norm($('#jobDescriptionText, section#jobDescriptionText').text()) || null;
-        }
-    } else {
-        description_text = norm($('#jobDescriptionText, section#jobDescriptionText, article, #jobDescriptionTextContainer').text()) || null;
-    }
+  const job_types = (() => {
+    const out = new Set();
+    $('div[data-testid="job-details"] div:contains("Job type")').next().find('li').each((_, li) => out.add(norm($(li).text())));
+    $('li').each((_, li) => {
+      const t = norm($(li).text());
+      if (/full[-\s]?time|part[-\s]?time|contract|temporary|intern(ship)?|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) out.add(t);
+    });
+    const arr = Array.from(out).filter(Boolean);
+    return arr.length ? arr : null;
+  })();
 
-    const date_posted = extractPosted($) ?? seed?.date_posted ?? null;
-
-    const job_types = (() => {
-        const types = new Set();
-        $('div[data-testid="job-details"] div:contains("Job type")')
-            .next()
-            .find('li')
-            .each((_, li) => types.add(norm($(li).text())));
-        // Mobile / generic fallback: scan for tokens
-        $('li').each((_, li) => {
-            const t = norm($(li).text());
-            if (/full[-\s]?time|part[-\s]?time|contract|temporary|intern(ship)?|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) {
-                types.add(t);
-            }
-        });
-        const arr = Array.from(types).filter(Boolean);
-        return arr.length ? arr : null;
-    })();
-
-    return {
-        title,
-        company,
-        location,
-        date_posted,
-        description_html: description_html || null,
-        description_text,
-        job_types,
-        url,
-    };
-};
+  return {
+    title,
+    company,
+    location,
+    date_posted,
+    jobpasted: date_posted, // alias for compatibility with your expected column
+    description_html: description_html || null,
+    description_text,
+    job_types,
+    url,
+  };
+}
 
 // ----------------- MAIN -----------------
 await Actor.init();
 
 const input = (await Actor.getInput()) || {};
 const {
-    keyword = '',
-    location = '',
-    postedWithin = '7d',   // '24h' | '7d' | '30d'
-    results_wanted = 200,
-    maxConcurrency = 5,
-    proxyConfiguration = null,
+  keyword = 'office',
+  location = 'United States',
+  postedWithin = '7d',        // '24h' | '7d' | '30d'
+  results_wanted = 100,
+  maxConcurrency = 2,         // start conservative; scale once stable
+  proxyConfiguration = null,
 } = input;
 
 const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
 
-// Build desktop & mobile LIST seeds up-front (so a desktop 403 doesn't kill the run)
-const fromage = DATE_MAP[postedWithin];
-const makeListUrl = (host) => {
-    const u = new URL('/jobs', host);
-    if (keyword)  u.searchParams.set('q', keyword);
-    if (location) u.searchParams.set('l', location);
-    if (fromage)  u.searchParams.set('fromage', fromage);
-    return u.toString();
-};
-const listSeeds = [
-    { url: makeListUrl(DESKTOP_HOST), label: 'LIST_DESKTOP' },
-    { url: makeListUrl(MOBILE_HOST),  label: 'LIST_MOBILE'  },
-];
+// ---------- 1) RSS bootstrap (cheap; provides posted date via <pubDate>) ----------
+const fromage = DATE_MAP[postedWithin] || '7';
+const rssUrl = new URL('/rss', DESKTOP);
+if (keyword) rssUrl.searchParams.set('q', keyword);
+if (location) rssUrl.searchParams.set('l', location);
+rssUrl.searchParams.set('fromage', fromage);
 
-const state = { enqueued: 0, saved: 0, pages: { desktop: 0, mobile: 0 } };
+let seedDetails = [];
+try {
+  for (let i = 0; i < 5 && seedDetails.length === 0; i++) {
+    const px = proxyConfig ? await proxyConfig.newUrl() : undefined;
+    await pace();
+    const resp = await requestAsBrowser({
+      url: rssUrl.href,
+      proxyUrl: px,
+      headers: {
+        'User-Agent': pickUA(false),
+        'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Connection': 'close',
+      },
+      http2: false,
+      timeout: { request: 45000 },
+    });
 
+    if ((resp.statusCode || 0) >= 500 || resp.statusCode === 429) {
+      log.warning(`RSS HTTP ${resp.statusCode}; retrying…`);
+      continue;
+    }
+    if ((resp.statusCode || 0) >= 400) {
+      log.warning(`RSS HTTP ${resp.statusCode}; will fall back to SERP.`);
+      break;
+    }
+
+    const $x = cheerio.load(resp.body || '', { xmlMode: true });
+    $x('item').each((_, el) => {
+      if (seedDetails.length >= results_wanted) return;
+      const $el = $x(el);
+      const link = $el.find('link').text();
+      const title = norm($el.find('title').text());
+      const pubDate = norm($el.find('pubDate').text());
+      const jk = jkFrom(link);
+      if (!jk) return;
+
+      // title often like "Role - Company - Location"
+      const parts = title.split(' - ').map(norm).filter(Boolean);
+      const seed = {
+        label: 'DETAIL',
+        title: parts[0] || title || null,
+        company: parts.length >= 2 ? parts[parts.length - 2] : null,
+        location: parts.length >= 3 ? parts[parts.length - 1] : null,
+        date_posted: pubDate || null,
+      };
+      seedDetails.push({ url: `${MOBILE}/viewjob?jk=${jk}`, userData: seed });
+    });
+  }
+
+  if (seedDetails.length) log.info(`Bootstrapped ${seedDetails.length} jobs from RSS.`);
+} catch (e) {
+  log.warning(`RSS bootstrap failed: ${e.message}`);
+}
+
+// ---------- 2) Mobile SERP discovery if RSS produced nothing ----------
+const listSeedUrl = (() => {
+  const u = new URL('/jobs', MOBILE);
+  if (keyword) u.searchParams.set('q', keyword);
+  if (location) u.searchParams.set('l', location);
+  u.searchParams.set('fromage', fromage);
+  return u.href;
+})();
+
+const state = { saved: 0, enq: 0 };
+
+// ---------- CheerioCrawler (Crawlee v3-safe) ----------
 const crawler = new CheerioCrawler({
-    proxyConfiguration: proxyConfig,
-    maxConcurrency,
-    useSessionPool: true,
-    persistCookiesPerSession: true,
-    maxRequestRetries: 3,
-    requestHandlerTimeoutSecs: 60,
-    navigationTimeoutSecs: 60,
+  proxyConfiguration: proxyConfig,
+  maxConcurrency: Math.max(1, Number(maxConcurrency) || 2),
+  useSessionPool: true,
+  persistCookiesPerSession: true,
+  maxRequestRetries: 8,
+  requestHandlerTimeoutSecs: 75,
+  navigationTimeoutSecs: 75,
+  sessionPoolOptions: {
+    maxPoolSize: Math.max(30, maxConcurrency * 12),
+    sessionOptions: { maxUsageCount: 20 },
+  },
 
-    // Crawlee 3.x-safe: set headers and pacing here
-    preNavigationHooks: [
-        async (ctx, gotOptions) => {
-            const { session, request } = ctx;
-            const ua = session?.userData?.ua || randomDesktopUA();
-            if (session && !session.userData.ua) session.userData.ua = ua;
+  preNavigationHooks: [
+    async ({ request, session }, gotOptions) => {
+      const isMobile = request.url.startsWith(MOBILE);
+      const ua = session?.userData?.ua || pickUA(isMobile);
+      if (session && !session.userData.ua) session.userData.ua = ua;
 
-            // Desktop-like headers even on mobile host (helps consistency)
-            gotOptions.headers = {
-                ...(gotOptions.headers || {}),
-                'User-Agent': ua,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'Upgrade-Insecure-Requests': '1',
-                'Referer': 'https://www.google.com/',
-                // Extra hints (harmless but helpful)
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Dest': 'document',
-            };
+      // conservative headers; keep HTTP/1.1 semantics via Connection: close
+      gotOptions.headers = {
+        ...(gotOptions.headers || {}),
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Upgrade-Insecure-Requests': '1',
+        'Referer': 'https://www.google.com/',
+        'Connection': 'close',
+      };
 
-            // Random jitter
-            await sleep(800 + Math.floor(Math.random() * 1400));
-        },
-    ],
+      // backoff based on retryCount + global pacing
+      const backoff = Math.min(5000, 700 * (1 << request.retryCount)); // 0,700,1400,2800,5600
+      if (backoff > 0) await sleep(backoff);
+      await pace();
+    },
+  ],
 
-    async requestHandler({ request, $, addRequests, response, session, log }) {
-        const label = request.userData?.label;
-        const status = response?.statusCode ?? response?.status;
+  async requestHandler(ctx) {
+    const { request, $, addRequests, sendRequest, response, session, log } = ctx;
+    const status = response?.statusCode ?? response?.status;
 
-        // Early block detection
-        if (status === 403 || status === 429) {
-            session?.markBad();
-            throw new Error(`Blocked ${status}`);
+    // Mark bad sessions on hard blocks to encourage rotation
+    if (status === 403 || status === 429) {
+      session?.markBad();
+      throw new Error(`Blocked ${status}`);
+    }
+    if (status >= 500) {
+      session?.markBad();
+      throw new Error(`HTTP ${status}`);
+    }
+
+    const { label } = request.userData || {};
+
+    // Mobile SERP listing
+    if (label === 'LIST') {
+      if (state.saved >= results_wanted) return;
+
+      const detailReqs = [];
+      $('a[href*="/viewjob?jk="]').each((_, el) => {
+        if (state.enq >= results_wanted) return;
+        const href = $(el).attr('href');
+        const jk = jkFrom(href);
+        if (!jk) return;
+
+        const url = `${MOBILE}/viewjob?jk=${jk}`;
+        const $card = $(el).closest('li, div');
+        const seed = { label: 'DETAIL' };
+
+        const sTitle = norm($card.find('h2, h3, .jobTitle').first().text());
+        const sCompany = norm($card.find('[data-company-name], .companyName').first().text());
+        const sLoc = norm($card.find('[data-testid="text-location"], .companyLocation').first().text());
+        const sPosted = norm(
+          $card.find('span:contains("Posted"), span:contains("Just posted"), span:contains("Today"), span:contains("Active"), span.date, .css-1v0q9r6').first().text()
+        );
+
+        if (sTitle) seed.title = sTitle;
+        if (sCompany) seed.company = sCompany;
+        if (sLoc) seed.location = sLoc;
+        if (sPosted) seed.date_posted = sPosted;
+
+        detailReqs.push({ url, userData: seed });
+        state.enq += 1;
+      });
+
+      if (detailReqs.length) await addRequests(detailReqs);
+
+      // paginate only if we still need more
+      if (state.enq < results_wanted) {
+        let nextUrl;
+        const nextHref = $('a[aria-label="Next"], a[data-testid="pagination-page-next"]').attr('href');
+        if (nextHref) {
+          nextUrl = new URL(nextHref, MOBILE).href;
+        } else {
+          const u = new URL(request.url);
+          const start = parseInt(u.searchParams.get('start') || '0', 10);
+          u.searchParams.set('start', String(start + 10));
+          nextUrl = u.href;
         }
+        await addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
+      }
+      return;
+    }
 
-        // ----------------- LIST (desktop or mobile) -----------------
-        if (label === 'LIST_DESKTOP' || label === 'LIST_MOBILE') {
-            const isMobile = label === 'LIST_MOBILE';
-            if (isMobile) state.pages.mobile += 1;
-            else state.pages.desktop += 1;
+    // DETAIL: mobile-first; inline desktop fallback if content looks thin
+    let $$ = $;
+    const thin = !$$ || (!$('#jobDescriptionText, #jobDescriptionTextContainer').length && $$.root().text().trim().length < 80);
 
-            log.info(`${label} page #${isMobile ? state.pages.mobile : state.pages.desktop}: ${request.url}`);
-
-            // Find detail links — ONLY via /viewjob?jk=... to avoid /rc/clk & /pagead/clk 403s
-            const detailReqs = [];
-            const host = isMobile ? MOBILE_HOST : DESKTOP_HOST;
-
-            // 1) Prefer explicit viewjob links (works on both sites)
-            $('a[href*="/viewjob?jk="]').each((_, el) => {
-                if (state.enqueued >= results_wanted) return;
-                const href = $(el).attr('href');
-                const jk = jkFromHref(href);
-                if (!jk) return;
-
-                const detailUrl = `${DESKTOP_HOST}/viewjob?jk=${jk}`; // request desktop first
-                const seed = {};
-
-                const title = norm($(el).find('h2, h3, .jobTitle').first().text()) || null;
-                if (title) seed.title = title;
-
-                const company = norm($(el).closest('[data-company-name]').attr('data-company-name') || $(el).closest('.job_seen_beacon').find('[data-company-name], .companyName').first().text() || '');
-                if (company) seed.company = company;
-
-                const loc = norm($(el).closest('.job_seen_beacon').find('[data-testid="text-location"], .companyLocation').first().text() || '');
-                if (loc) seed.location = loc;
-
-                const posted = norm($(el).closest('.job_seen_beacon, li, div').find('span:contains("Posted"), span:contains("Just posted"), span:contains("Today")').first().text() || '');
-                if (posted) seed.date_posted = posted;
-
-                detailReqs.push({ url: detailUrl, userData: { label: 'DETAIL', ...seed } });
-                state.enqueued += 1;
-            });
-
-            // 2) Also try to mine jk from card containers if present
-            $('[data-jk]').each((_, el) => {
-                if (state.enqueued >= results_wanted) return;
-                const jk = $(el).attr('data-jk');
-                if (!jk) return;
-                const detailUrl = `${DESKTOP_HOST}/viewjob?jk=${jk}`;
-                detailReqs.push({ url: detailUrl, userData: { label: 'DETAIL' } });
-                state.enqueued += 1;
-            });
-
-            if (detailReqs.length) await addRequests(detailReqs);
-            if (state.enqueued >= results_wanted) return;
-
-            // Pagination
-            let nextUrl;
-            const nextHref = $('a[aria-label="Next"], a[data-testid="pagination-page-next"]').attr('href');
-            if (nextHref) {
-                nextUrl = new URL(nextHref, host).href;
-            } else {
-                const u = new URL(request.url);
-                const current = parseInt(u.searchParams.get('start') || '0', 10);
-                u.searchParams.set('start', String(current + 10));
-                nextUrl = u.href;
-            }
-            await addRequests([{ url: nextUrl, userData: { label } }]);
-
-            return;
-        }
-
-        // ----------------- DETAIL -----------------
-        let $$ = $;
-        if (!$$) {
-            // Fallback refetch with same session headers
-            const resp = await this.sendRequest({ url: request.url, responseType: 'text' });
-            if (resp.statusCode === 403 || resp.statusCode === 429) {
-                session?.markBad();
-                throw new Error(`Blocked ${resp.statusCode} on detail`);
-            }
+    if (thin) {
+      try {
+        const jk = jkFrom(request.url) || request.url.match(/[?&]jk=([a-z0-9]+)/i)?.[1];
+        if (jk) {
+          await pace();
+          const resp = await sendRequest({ url: `${DESKTOP}/viewjob?jk=${jk}`, responseType: 'text' });
+          if (resp.statusCode === 200 && resp.body?.length > 100) {
             $$ = cheerio.load(resp.body);
+          }
         }
+      } catch {
+        // keep seed-only if fallback blocked
+      }
+    }
 
-        // If the desktop detail page looks blocked/empty, try mobile viewjob as a fallback
-        const looksBlocked = !$$('#jobDescriptionText, #jobDescriptionTextContainer').length && /verify|robot|captcha|unusual traffic/i.test($$.root().text());
-        if (looksBlocked || ($$.root().text().trim().length < 50)) {
-            try {
-                const jk = jkFromHref(request.url) || request.url.match(/[?&]jk=([a-z0-9]+)/i)?.[1];
-                if (jk) {
-                    const altUrl = `${MOBILE_HOST}/viewjob?jk=${jk}`;
-                    const resp = await this.sendRequest({ url: altUrl, responseType: 'text' });
-                    if (resp.statusCode !== 403 && resp.statusCode !== 429) {
-                        $$ = cheerio.load(resp.body);
-                    }
-                }
-            } catch { /* ignore */ }
-        }
+    if (!$$) $$ = cheerio.load('<html></html>');
+    const result = extractDetail($$, request.url, request.userData);
 
-        const result = extractDetail($$, request.url, request.userData);
-        await Dataset.pushData(result);
-        state.saved += 1;
-        log.debug(`Saved: ${result.title || '(untitled)'} — ${result.company || ''}`);
-    },
+    await Dataset.pushData(result);
+    state.saved += 1;
+  },
 
-    failedRequestHandler: ({ request, error, session }) => {
-        // Don’t stop the whole run; mark session bad and continue
-        session?.markBad?.();
-        log.error(`Failed after retries: ${request.url} — ${error?.message}`);
-    },
+  failedRequestHandler({ request, error, session, log }) {
+    session?.markBad?.();
+    log.error(`Failed after retries: ${request.url} — ${error?.message}`);
+  },
 });
 
-// ---------- Kickoff with BOTH list seeds (desktop + mobile) ----------
-await crawler.addRequests(listSeeds.map(s => ({ url: s.url, userData: { label: s.label } })));
-await crawler.run();
+// ---------- Kickoff ----------
+if (seedDetails.length) {
+  await crawler.addRequests(seedDetails.slice(0, results_wanted));
+  log.info(`Discovery via RSS: enqueued ${Math.min(seedDetails.length, results_wanted)} detail pages.`);
+} else {
+  await crawler.addRequests([{ url: listSeedUrl, userData: { label: 'LIST' } }]);
+  log.info(`Discovery via mobile SERP: ${listSeedUrl}`);
+}
 
-log.info(`Done. Enqueued ${state.enqueued}, saved ${state.saved}, pages D:${state.pages.desktop} M:${state.pages.mobile}.`);
+await crawler.run();
+log.info(`Done. Saved ${state.saved} jobs.`);
 await Actor.exit();
