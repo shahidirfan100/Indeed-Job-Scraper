@@ -1,32 +1,32 @@
+// src/main.js — Indeed version aligned to your Workable actor’s contract & style
 import { Actor } from 'apify';
-import { CheerioCrawler, Dataset, log } from 'crawlee';
+import { CheerioCrawler, Dataset, log, sleep } from 'crawlee';
 import * as cheerio from 'cheerio';
-import { gotScraping } from 'got-scraping';
 
-// ——— CONSTANTS ———
+// -------- Config mirrors your project --------
 const BASE_URL = 'https://www.indeed.com';
-const DATE_POSTED_MAP = { '24h': '1', '7d': '7', '30d': '30' };
+const dateMap = { '24h': '1', '7d': '7', '30d': '30' }; // maps postedWithin -> fromage
 
-// ——— HELPERS ———
+// -------- Helpers (same approach as your style) --------
 const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
 
-const pickText = ($, selectors) => {
+function pickText($, selectors) {
     for (const sel of selectors) {
         const txt = $(sel).first().text();
         if (txt && norm(txt)) return norm(txt);
     }
     return null;
-};
+}
 
-const pickHtml = ($, selectors) => {
+function pickHtml($, selectors) {
     for (const sel of selectors) {
         const html = $(sel).first().html();
         if (html && norm(html)) return html.trim();
     }
     return null;
-};
+}
 
-const randomDesktopUA = () => {
+function randomDesktopUA() {
     const uas = [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
@@ -34,47 +34,119 @@ const randomDesktopUA = () => {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
     ];
     return uas[Math.floor(Math.random() * uas.length)];
-};
+}
 
-// ——— MAIN ———
+// Extract fields from a job detail page to your expected schema
+function extractDetail($, url, seed) {
+    const title = pickText($, [
+        'h1[data-testid="jobsearch-JobTitle"]',
+        'h1.jobsearch-JobInfoHeader-title',
+        'h1',
+    ]) ?? seed?.title ?? null;
+
+    const company = pickText($, [
+        '[data-company-name] a',
+        '[data-company-name]',
+        'div[data-testid="inlineHeader-companyName"]',
+        '.jobsearch-CompanyInfoWithoutHeaderImage div a',
+        '.jobsearch-CompanyInfoWithoutHeaderImage div',
+    ]) ?? seed?.company ?? null;
+
+    const location = pickText($, [
+        'div[data-testid="inlineHeader-companyLocation"]',
+        '.jobsearch-CompanyInfoWithoutHeaderImage > div:last-child',
+    ]) ?? seed?.location ?? null;
+
+    const description_html = pickHtml($, [
+        '#jobDescriptionText',
+        'div#jobDescriptionText',
+        'section#jobDescriptionText',
+    ]);
+
+    let description_text = null;
+    if (description_html) {
+        try {
+            const $$ = cheerio.load(description_html);
+            description_text = $$.text().replace(/\s+\n/g, '\n').replace(/\s{2,}/g, ' ').trim() || null;
+        } catch {
+            description_text = $('#jobDescriptionText').text().trim() || null;
+        }
+    } else {
+        description_text = $('#jobDescriptionText, section#jobDescriptionText, article').text().trim() || null;
+    }
+
+    // date_posted: keep the same name as your Workable pipeline expects
+    const date_posted = pickText($, [
+        'div.jobsearch-JobMetadataFooter > div:last-child',
+        'div[data-testid="jobsearch-JobMetadataFooter"] span:contains("Posted")',
+        'span:contains("Just posted")',
+        'span:contains("Today")',
+        'span:contains("Active")',
+    ]) ?? seed?.date_posted ?? null;
+
+    // job_types from detail page
+    const job_types = (() => {
+        const types = new Set();
+        $('div[data-testid="job-details"] div:contains("Job type")')
+            .next()
+            .find('li')
+            .each((_, li) => types.add(norm($(li).text())));
+        $('li').each((_, li) => {
+            const t = norm($(li).text());
+            if (/full[-\s]?time|part[-\s]?time|contract|temporary|intern(ship)?|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) {
+                types.add(t);
+            }
+        });
+        const arr = Array.from(types).filter(Boolean);
+        return arr.length ? arr : null;
+    })();
+
+    return {
+        title,
+        company,
+        location,
+        date_posted,
+        description_html: description_html || null,
+        description_text,
+        job_types,
+        url,
+    };
+}
+
 await Actor.init();
 
+// -------- Inputs: keep EXACTLY your working contract --------
 const input = (await Actor.getInput()) || {};
 const {
-    keyword,
+    keyword = '',
     location = '',
-    posted_date = 'anytime',    // 'anytime' | '24h' | '7d' | '30d'
-    max_pages = 5,
-    max_items = 200,
-    proxyConfiguration,         // unchanged; driven by your input schema
+    postedWithin = '7d',     // '24h' | '7d' | '30d'
+    results_wanted = 200,    // cap results like your Workable actor
+    maxConcurrency = 5,      // keep same control as your working file
+    proxyConfiguration = null,
 } = input;
 
-if (!keyword || !keyword.trim()) {
-    throw new Error('Input "keyword" is required.');
-}
+const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
 
-// Build initial search URL
+// Build Indeed search URL using same variables
 const startUrl = new URL('/jobs', BASE_URL);
-startUrl.searchParams.set('q', keyword);
+if (keyword) startUrl.searchParams.set('q', keyword);
 if (location) startUrl.searchParams.set('l', location);
-if (posted_date !== 'anytime' && DATE_POSTED_MAP[posted_date]) {
-    startUrl.searchParams.set('fromage', DATE_POSTED_MAP[posted_date]);
-}
+const fromage = dateMap[postedWithin];
+if (fromage) startUrl.searchParams.set('fromage', fromage);
 
-let itemCount = 0;
-let pageCount = 0;
+const state = { collectedCount: 0, pageCount: 0 };
 
 const crawler = new CheerioCrawler({
+    proxyConfiguration: proxyConfig,
+    maxConcurrency,
     useSessionPool: true,
     persistCookiesPerSession: true,
-    proxyConfiguration: await Actor.createProxyConfiguration?.(proxyConfiguration),
-
-    maxConcurrency: 2,
-    maxRequestRetries: 3,
     requestHandlerTimeoutSecs: 60,
+    navigationTimeoutSecs: 60,
+    maxRequestRetries: 3,
 
-    // Supported way in CheerioCrawler 3.x: modify got (HTTP client) options here
-    // (see docs/examples). We'll set headers and add a small jitter. :contentReference[oaicite:2]{index=2}
+    // Crawlee 3.x-safe: set headers and add jitter here
     preNavigationHooks: [
         async (ctx, gotOptions) => {
             const { session } = ctx;
@@ -89,175 +161,94 @@ const crawler = new CheerioCrawler({
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
                 'Upgrade-Insecure-Requests': '1',
-                // a benign referrer helps on list pages
                 'Referer': 'https://www.google.com/',
             };
 
-            // Gentle jitter (800–2200ms) between requests to reduce rate-based blocks
-            const sleepMs = 800 + Math.floor(Math.random() * 1400);
-            await Actor.sleep(sleepMs);
+            // gentle jitter like your style; use crawlee.sleep
+            const ms = 800 + Math.floor(Math.random() * 1400);
+            await sleep(ms);
         },
     ],
 
-    async requestHandler(ctx) {
-        const { request, $, response, session, log, crawler } = ctx;
+    async requestHandler({ request, $, addRequests, response, session, log }) {
         const { label } = request.userData || {};
-
-        // Early block detection (compatible with Crawlee 3.x)
         const status = response?.statusCode ?? response?.status;
         if (status === 403 || status === 429) {
-            log.warning(`Blocked with status ${status} on ${request.url}. Marking session bad.`);
             session?.markBad();
             throw new Error(`Blocked ${status}`);
         }
         if ($) {
-            const pageText = norm($.root().text().slice(0, 2000)).toLowerCase();
-            if (/verify|robot|unusual traffic|are you a human|captcha/.test(pageText)) {
-                log.warning(`Verification/bot page detected: ${request.url}`);
+            const text = norm($.root().text().slice(0, 2000)).toLowerCase();
+            if (/verify|robot|unusual traffic|are you a human|captcha/.test(text)) {
                 session?.markBad();
-                throw new Error('Bot/verification challenge');
+                throw new Error('Bot/verification page');
             }
         }
 
         if (label === 'LIST') {
-            pageCount += 1;
-            log.info(`LIST page ${pageCount}: ${request.url}`);
+            state.pageCount += 1;
+            log.info(`LIST page ${state.pageCount}: ${request.url}`);
 
-            // Collect job detail links
-            const jobLinks = [];
+            // Collect detail links from cards
+            const detailUrls = [];
             $('a.tapItem[href], a[data-jk][href]').each((_, el) => {
                 const href = $(el).attr('href');
                 if (!href) return;
                 if (/^https?:\/\/(www\.)?google\./i.test(href)) return; // skip ad redirects
                 const abs = new URL(href, BASE_URL).href;
-                jobLinks.push(abs);
+                detailUrls.push(abs);
             });
 
-            for (const url of jobLinks) {
-                if (itemCount >= max_items) break;
-                await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
+            for (const url of detailUrls) {
+                if (state.collectedCount >= results_wanted) break;
+                await addRequests([{ url, userData: { label: 'DETAIL' } }]);
+                state.collectedCount += 1;
             }
 
-            // Pagination (prefer "Next", else bump ?start= by 10)
-            if (pageCount < max_pages && itemCount < max_items) {
-                const nextSel = 'a[aria-label="Next"], a[data-testid="pagination-page-next"]';
-                const nextHref = $(nextSel).attr('href');
-                if (nextHref) {
-                    const nextUrl = new URL(nextHref, BASE_URL).href;
-                    await crawler.addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
-                } else {
-                    const u = new URL(request.url);
-                    const current = parseInt(u.searchParams.get('start') || '0', 10);
-                    u.searchParams.set('start', String(current + 10));
-                    await crawler.addRequests([{ url: u.href, userData: { label: 'LIST' } }]);
-                }
+            // Stop if we hit the cap
+            if (state.collectedCount >= results_wanted) return;
+
+            // Pagination: prefer a Next link, else increment ?start= by 10
+            const nextSel = 'a[aria-label="Next"], a[data-testid="pagination-page-next"]';
+            const nextHref = $(nextSel).attr('href');
+            let nextUrl = null;
+            if (nextHref) {
+                nextUrl = new URL(nextHref, BASE_URL).href;
+            } else {
+                const u = new URL(request.url);
+                const current = parseInt(u.searchParams.get('start') || '0', 10);
+                u.searchParams.set('start', String(current + 10));
+                nextUrl = u.href;
             }
+            await addRequests([{ url: nextUrl, userData: { label: 'LIST' } }]);
 
         } else {
-            // DETAIL PAGE — if $ missing, fetch via got-scraping (same headers via UA)
+            // DETAIL page
             let $$ = $;
             if (!$$) {
-                const ua = session?.userData?.ua || randomDesktopUA();
-                const resp = await gotScraping({
-                    url: request.url,
-                    headers: {
-                        'User-Agent': ua,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Upgrade-Insecure-Requests': '1',
-                        'Referer': 'https://www.google.com/',
-                    },
-                });
+                // Fallback: refetch HTML via Crawlee client (inherits headers/session)
+                const resp = await this.sendRequest({ url: request.url, responseType: 'text' });
                 if (resp.statusCode === 403 || resp.statusCode === 429) {
                     session?.markBad();
-                    throw new Error(`Blocked ${resp.statusCode} on detail fetch`);
+                    throw new Error(`Blocked ${resp.statusCode} on detail`);
                 }
                 $$ = cheerio.load(resp.body);
             }
 
-            // ——— Field extraction ———
-            const title = pickText($$, [
-                'h1[data-testid="jobsearch-JobTitle"]',
-                'h1.jobsearch-JobInfoHeader-title',
-                'h1',
-            ]);
-
-            const company = pickText($$, [
-                '[data-company-name] a',
-                '[data-company-name]',
-                'div[data-testid="inlineHeader-companyName"]',
-                '.jobsearch-CompanyInfoWithoutHeaderImage div a',
-                '.jobsearch-CompanyInfoWithoutHeaderImage div',
-            ]);
-
-            const locationText = pickText($$, [
-                'div[data-testid="inlineHeader-companyLocation"]',
-                '.jobsearch-CompanyInfoWithoutHeaderImage > div:last-child',
-            ]);
-
-            const descriptionHtml = pickHtml($$, [
-                '#jobDescriptionText',
-                'div#jobDescriptionText',
-                'section#jobDescriptionText',
-            ]);
-
-            const descriptionText = descriptionHtml
-                ? norm($$('#jobDescriptionText').text())
-                : pickText($$, ['#jobDescriptionText', 'section#jobDescriptionText', 'article']);
-
-            const jobPosted =
-                pickText($$, [
-                    'div.jobsearch-JobMetadataFooter > div:last-child',
-                    'div[data-testid="jobsearch-JobMetadataFooter"] span:contains("Posted")',
-                    'span:contains("Just posted")',
-                    'span:contains("Today")',
-                    'span:contains("Active")',
-                ]) || null;
-
-            const jobTypes = (() => {
-                const types = new Set();
-                // Primary (newer detail grid)
-                $$('div[data-testid="job-details"] div:contains("Job type")')
-                    .next()
-                    .find('li')
-                    .each((_, li) => types.add(norm($$(li).text())));
-                // Fallback token scan
-                $$('li').each((_, li) => {
-                    const t = norm($$(li).text());
-                    if (/full[-\s]?time|part[-\s]?time|contract|temporary|internship|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) {
-                        types.add(t);
-                    }
-                });
-                const arr = Array.from(types).filter(Boolean);
-                return arr.length ? arr : null;
-            })();
-
-            const out = {
-                title: title || null,
-                company: company || null,
-                location: locationText || null,
-                description_text: descriptionText || null,
-                description_html: descriptionHtml || null,
-                job_posted: jobPosted,
-                job_types: jobTypes,
-                url: request.url,
-            };
-
-            await Dataset.pushData(out);
-            itemCount += 1;
-            log.debug(`Saved item #${itemCount}: ${out.title || out.url}`);
+            const result = extractDetail($$, request.url, request.userData);
+            await Dataset.pushData(result);
+            log.debug(`Saved: ${result.title || '(untitled)'} — ${result.company || ''}`);
         }
     },
 
-    failedRequestHandler({ request, error, session, log }) {
-        log.error(`Request failed after retries: ${request.url} — ${error && error.message}`);
-        session?.markBad?.();
+    async failedRequestHandler({ request }) {
+        log.warning(`Request failed and reached max retries: ${request.url}`);
     },
 });
 
-// Kickoff
-log.info(`Starting crawl with URL: ${startUrl.href}`);
-await crawler.run([{ url: startUrl.href, userData: { label: 'LIST' } }]);
+// Kickoff (mirror your style)
+await crawler.addRequests([{ url: startUrl.toString(), userData: { label: 'LIST' } }]);
+await crawler.run();
 
-log.info(`Done. Saved ${itemCount} items across ${pageCount} list page(s).`);
+log.info(`Scraper finished. Collected ${state.collectedCount} items across ${state.pageCount} list page(s).`);
 await Actor.exit();
