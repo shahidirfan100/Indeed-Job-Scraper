@@ -1,0 +1,10 @@
+{
+  "actorSpecification": 1,
+  "name": "indeed-jobs-scraper",
+  "version": "1.0.0",
+  "buildTag": "latest",
+  "dockerfile": "./Dockerfile",
+  "readme": "../README.md",
+  "input": "./input_schema.json",
+  "nodeJsVersion": "22"
+}

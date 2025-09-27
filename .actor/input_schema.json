@@ -1,0 +1,59 @@
+{
+  "title": "Indeed Jobs Scraper",
+  "description": "Scrapes job listings from Indeed using a keyword and optional location.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "keyword": {
+      "title": "Keyword",
+      "type": "string",
+      "description": "Search term(s) for jobs (e.g., 'Software Engineer').",
+      "editor": "textfield"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Geographic location to search for jobs (e.g., 'New York, NY', 'Remote').",
+      "editor": "textfield"
+    },
+    "posted_date": {
+      "title": "Date Posted",
+      "type": "string",
+      "description": "Filter jobs by when they were posted.",
+      "editor": "select",
+      "enum": [
+        "anytime",
+        "24h",
+        "7d",
+        "30d"
+      ],
+      "enumTitles": [
+        "Any time",
+        "Past 24 hours",
+        "Past 7 days",
+        "Past 30 days"
+      ],
+      "default": "anytime"
+    },
+    "results_wanted": {
+      "title": "Results Wanted",
+      "type": "integer",
+      "description": "Maximum number of jobs to fetch.",
+      "editor": "number",
+      "default": 100,
+      "minimum": 1
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Select proxies to be used by the crawler.",
+      "editor": "proxy",
+      "prefill": {
+        "useApifyProxy": true
+      }
+    }
+  },
+  "required": [
+    "keyword"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "linkedin-jobs-actor-lite",
+  "version": "2.1.1",
+  "description": "Lightweight LinkedIn jobs scraper using Cheerio and guest endpoints.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.4.5",
+    "crawlee": "^3.14.1",
+    "cheerio": "^1.0.0-rc.12",
+    "got-scraping": "^4.0.3"
+  }
+}

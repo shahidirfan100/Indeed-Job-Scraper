@@ -1,0 +1,14 @@
+{
+  "query": "admin",
+  "location": "Worldwide",
+  "timeRange": "24h",
+  "maxJobs": 50,
+  "collectOnly": false,
+  "maxConcurrency": 5,
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "groups": [
+      "RESIDENTIAL"
+    ]
+  }
+}
