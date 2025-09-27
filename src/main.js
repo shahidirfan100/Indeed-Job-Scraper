@@ -1,97 +1,87 @@
-// Indeed jobs scraper — HTTP requests + Cheerio (no Crawlee request helpers).
-// Discovery: Mobile SERP -> Desktop SERP -> RSS (as last resort)
-// Each SERP page uses 3 extraction modes: DOM anchors, Mosaic JSON, and Regex.
-// Detail: Mobile /viewjob?jk=… first; Desktop /viewjob?jk=… fallback if mobile thin.
-// Anti-blocking: Apify proxy rotation, got-scraping header generator, pacing, backoff.
-// Outputs: title, company, location, description_html, description_text, date_posted, job_types, url.
+// Node 22 / Apify SDK v3 / Crawlee v3 — HTTP-only Indeed scraper with CheerioCrawler
+// Discovery: Mobile SERP → Desktop SERP; per page use DOM + Mosaic JSON + Regex to find JKs
+// Details: Mobile /viewjob?jk=… first; Desktop fallback if description is thin
+// Fields: title, company, location, description_html, description_text, date_posted, job_types, url
 
 import { Actor, log } from 'apify';
-import { gotScraping } from 'got-scraping';
+import {
+    CheerioCrawler,
+    createCheerioRouter,
+    Dataset,
+    RequestQueue,
+} from 'crawlee';
 import * as cheerio from 'cheerio';
 
-// ------------ constants ------------
+// ----------------- helpers -----------------
 const DATE_MAP = { '24h': '1', '7d': '7', '30d': '30' };
-const MIN_GAP_MS = 1100;
-
-let lastTs = 0;
-async function pace() {
-    const now = Date.now();
-    const delta = now - lastTs;
-    if (delta < MIN_GAP_MS) await Actor.sleep(MIN_GAP_MS - delta);
-    lastTs = Date.now();
-}
 
 const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
 const stripDom = ($root) => { $root('script,style,noscript').remove(); };
 
-const jkFrom = (href, base) => {
-    try { const u = new URL(href, base); return u.searchParams.get('jk'); } catch { return null; }
-};
-
-function buildHeaders({ mobile }) {
-    // got-scraping can synthesize realistic headers for us
-    return {
-        // These two enable header generator
-        'sec-fetch-site': 'same-origin',
-        'sec-fetch-mode': 'navigate',
-        // we'll still set U-A via headerGeneratorOptions; no static UA here
-    };
-}
-
-async function fetchHtml(url, { proxyConfig, mobile=false, attempts=4, timeoutMs=60000 }) {
-    let lastErr;
-    for (let i = 0; i < attempts; i++) {
-        try {
-            await pace();
-            const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : undefined;
-            const res = await gotScraping({
-                url,
-                headers: buildHeaders({ mobile }),
-                // IMPORTANT: header generator here is OK (the earlier error was only with CheerioCrawler options)
-                headerGeneratorOptions: {
-                    browsers: [{ name: mobile ? 'chrome' : 'chrome', minVersion: 118 }],
-                    devices: [mobile ? 'mobile' : 'desktop'],
-                    operatingSystems: mobile ? ['android', 'ios'] : ['windows', 'macos'],
-                },
-                proxyUrl,
-                timeout: { request: timeoutMs },
-                http2: false,
-                throwHttpErrors: false,
-            });
-
-            const sc = res.statusCode || 0;
-            if (sc === 403 || sc === 429) { lastErr = new Error(`HTTP ${sc}`); continue; }
-            if (sc >= 500) { lastErr = new Error(`HTTP ${sc}`); continue; }
-            if (!res.body || res.body.length < 80) { lastErr = new Error(`Thin body (${res.body?.length || 0})`); continue; }
-            return res.body;
-        } catch (e) {
-            lastErr = e;
-        }
-        const backoff = Math.min(7000, 700 * (1 << i)) + Math.floor(Math.random() * 250);
-        await Actor.sleep(backoff);
-    }
-    throw lastErr || new Error('Failed to fetch');
-}
-
-// --- posted date from footer text only ---
-function postedFromDetail($) {
-    const t = norm($('div.jobsearch-JobMetadataFooter, [data-testid="jobsearch-JobMetadataFooter"]').text());
-    if (!t) return null;
-    const pats = [
-        /(Just posted|Today)/i,
-        /Posted\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
-        /\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
-        /Active\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+function pickUA(isMobile) {
+    const DESKTOP = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
     ];
-    for (const re of pats) { const m = t.match(re); if (m) return m[0]; }
-    const m2 = t.match(/Posted[^|]+/i);
-    return m2 ? m2[0].trim() : null;
+    const MOBILE = [
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 14; SM-G990B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+    ];
+    const arr = isMobile ? MOBILE : DESKTOP;
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function jkFrom(href, base) {
+    try { const u = new URL(href, base); return u.searchParams.get('jk'); } catch { return null; }
+}
+
+function discoverJKsFromDom($, base) {
+    const set = new Set();
+    $('a[href*="/viewjob?jk="]').each((_, a) => {
+        const href = $(a).attr('href');
+        const jk = jkFrom(href, base);
+        if (jk) set.add(jk);
+    });
+    return Array.from(set);
+}
+
+function discoverJKsFromMosaic(html) {
+    // Parse inline window.mosaic.providerData JSON without strict JSON.parse
+    const set = new Set();
+    const block =
+        html.match(/window\.mosaic\.providerData\s*=\s*({[\s\S]*?});\s*<\/script>/i)
+        || html.match(/"mosaic-provider-jobcards"[\s\S]*?({[\s\S]*?})\s*<\/script>/i);
+    if (block) {
+        const text = block[0];
+        let m;
+        const re1 = /"jk"\s*:\s*"([a-z0-9]{16})"/gi;
+        while ((m = re1.exec(text)) !== null) set.add(m[1]);
+        const re2 = /jobKeysWithInfo[^[]*\[([^\]]+)\]/gi;
+        while ((m = re2.exec(text)) !== null) {
+            const ids = (m[1].match(/"([a-z0-9]{16})"/gi) || []).map((s) => s.replace(/"/g, ''));
+            for (const id of ids) set.add(id);
+        }
+    }
+    return Array.from(set);
+}
+
+function discoverJKsByRegex(html) {
+    const set = new Set();
+    let m;
+    const re = /\/viewjob\?[^"'<>]*?\bjk=([a-z0-9]{16})/gi;
+    while ((m = re.exec(html)) !== null) set.add(m[1]);
+    return Array.from(set);
 }
 
 const firstText = ($, sels) => {
     for (const s of sels) {
         const el = $(s).first();
-        if (el.length) { const txt = norm(el.text()); if (txt) return txt; }
+        if (el.length) {
+            const txt = norm(el.text());
+            if (txt) return txt;
+        }
     }
     return null;
 };
@@ -105,6 +95,20 @@ const firstHtml = ($, sels) => {
     }
     return null;
 };
+
+function postedFromDetail($) {
+    const t = norm($('div.jobsearch-JobMetadataFooter, [data-testid="jobsearch-JobMetadataFooter"]').text());
+    if (!t) return null;
+    const pats = [
+        /(Just posted|Today)/i,
+        /Posted\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+        /\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+        /Active\s+\d+\+?\s+(?:day|days|hour|hours)\s+ago/i,
+    ];
+    for (const re of pats) { const m = t.match(re); if (m) return m[0]; }
+    const m2 = t.match(/Posted[^|]+/i);
+    return m2 ? m2[0].trim() : null;
+}
 
 function extractDetail($, url, seed) {
     stripDom($);
@@ -163,257 +167,209 @@ function extractDetail($, url, seed) {
         return arr.length ? arr : null;
     })();
 
-    return { title, company, location, description_html: description_html || null, description_text, date_posted, job_types, url };
+    return {
+        title, company, location,
+        description_html: description_html || null,
+        description_text,
+        date_posted,
+        job_types,
+        url,
+    };
 }
 
-// ---- helpers: extract JKs from a SERP html by 3 strategies
-function discoverJKsFromDom($, baseUrl) {
-    const set = new Set();
-    $('a[href*="/viewjob?jk="]').each((_, a) => {
-        const href = $(a).attr('href');
-        const jk = jkFrom(href, baseUrl);
-        if (jk) set.add(jk);
-    });
-    return Array.from(set);
+// ----------------- main -----------------
+await Actor.init();
+const input = (await Actor.getInput()) || {};
+
+const {
+    keyword = 'office',
+    location = 'United States',
+    postedWithin = '7d',            // '24h'|'7d'|'30d'
+    results_wanted = 100,
+    maxPages = 40,
+    maxConcurrency = 2,
+    indeedDomain = 'www.indeed.com', // allow 'ca.indeed.com', 'uk.indeed.com', etc.
+    proxyConfiguration = { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'], apifyProxyCountry: 'US' },
+} = input;
+
+const fromage = DATE_MAP[postedWithin] || '7';
+const DESKTOP = `https://${indeedDomain}`;
+const MOBILE  = indeedDomain.startsWith('m.') ? `https://${indeedDomain}` : `https://m.${indeedDomain.replace(/^www\./, '')}`;
+
+const rq = await RequestQueue.open();
+let discovered = 0;
+let pushedDetails = 0;
+let pageCount = 0;
+
+// seed: start with MOBILE SERP
+{
+    const u = new URL('/jobs', MOBILE);
+    if (keyword)  u.searchParams.set('q', keyword);
+    if (location) u.searchParams.set('l', location);
+    if (fromage)  u.searchParams.set('fromage', fromage);
+    u.searchParams.set('filter', '0');
+    u.searchParams.set('radius', '25');
+    await rq.addRequest({ url: u.href, userData: { label: 'LIST', mobile: true, page: 0 } });
 }
 
-function discoverJKsFromMosaic(html) {
-    // Look for window.mosaic.providerData JSON blocks
-    const set = new Set();
-    const scriptMatches = html.match(/window\.mosaic\.providerData\s*=\s*({[\s\S]*?});\s*<\/script>/i)
-        || html.match(/"mosaic-provider-jobcards"[\s\S]*?({[\s\S]*?})\s*<\/script>/i);
-    if (scriptMatches) {
-        try {
-            // Try to parse loosely: extract all jk's from that JSON with regex (safer than full JSON.parse on partial)
-            const re = /"jk"\s*:\s*"([a-z0-9]+)"/gi;
-            let m;
-            while ((m = re.exec(scriptMatches[0])) !== null) set.add(m[1]);
-            // Also jobKeysWithInfo arrays
-            const re2 = /jobKeysWithInfo[^[]*\[([^\]]+)\]/gi;
-            let m2;
-            while ((m2 = re2.exec(scriptMatches[0])) !== null) {
-                const arr = m2[1].match(/"([a-z0-9]{16})"/gi) || [];
-                for (const x of arr) set.add(x.replace(/"/g, ''));
-            }
-        } catch { /* ignore */ }
+const router = createCheerioRouter();
+
+// LIST handler: discover JKs and paginate
+router.addHandler('LIST', async (ctx) => {
+    const { request, $, body, response, session, log: clog, proxyInfo, crawler } = ctx;
+    const { mobile, page } = request.userData || {};
+
+    // Anti-block: handle HTTP status
+    const status = response?.statusCode || response?.status;
+    if (status === 403 || status === 429) {
+        clog.warning(`Blocked ${status} on ${request.url} — rotate session`);
+        session?.markBad?.();
+        throw new Error(`Blocked ${status}`);
     }
-    return Array.from(set);
-}
+    if (status >= 500) {
+        session?.markBad?.();
+        throw new Error(`Upstream ${status}`);
+    }
+    if (!body || body.length < 100) throw new Error('Thin SERP body');
 
-function discoverJKsByRegex(html) {
-    const set = new Set();
-    const re = /\/viewjob\?[^"'<>]*?\bjk=([a-z0-9]{16})/gi;
-    let m;
-    while ((m = re.exec(html)) !== null) set.add(m[1]);
-    return Array.from(set);
-}
+    // extract JKs
+    const base = mobile ? MOBILE : DESKTOP;
+    const domJKs = discoverJKsFromDom($, base);
+    const mosaicJKs = discoverJKsFromMosaic(body);
+    const regexJKs = discoverJKsByRegex(body);
 
-function uniqueDetailTargets(jks, mobileBase, desktopBase) {
-    // Prefer mobile detail pages; desktop only for fallback during detail fetch
-    return jks.map((jk) => ({ url: `${mobileBase}/viewjob?jk=${jk}`, seed: {} }));
-}
+    const allJKs = Array.from(new Set([...domJKs, ...mosaicJKs, ...regexJKs]));
+    discovered += allJKs.length;
+    clog.info(`${mobile ? 'Mobile' : 'Desktop'} SERP page ${page}: DOM=${domJKs.length} Mosaic=${mosaicJKs.length} Regex=${regexJKs.length} totalJKs=${allJKs.length} discoveredSoFar=${discovered}`);
 
-// ----- discovery: generic SERP with triple extraction -----
-async function discoverSerp({ base, mobile, keyword, location, fromage, proxyConfig, wanted, maxPages = 40 }) {
-    const foundJKs = new Set();
-    let url = new URL('/jobs', base);
-    if (keyword)  url.searchParams.set('q', keyword);
-    if (location) url.searchParams.set('l', location);
-    if (fromage)  url.searchParams.set('fromage', fromage);
-    // broader results; avoid filters hiding posts
-    url.searchParams.set('filter', '0');
-    url.searchParams.set('radius', '25');
+    // push detail requests (mobile detail first)
+    for (const jk of allJKs) {
+        if (pushedDetails >= results_wanted) break;
+        const detailUrl = `${MOBILE}/viewjob?jk=${jk}`;
+        await rq.addRequest({
+            url: detailUrl,
+            userData: { label: 'DETAIL', jk, triedDesktop: false, seed: {} },
+        });
+        pushedDetails++;
+    }
 
-    for (let page = 0; page < maxPages && foundJKs.size < wanted; page++) {
-        let html;
-        try {
-            html = await fetchHtml(url.href, { proxyConfig, mobile, attempts: 4, timeoutMs: 45000 });
-        } catch (e) {
-            log.warning(`${mobile ? 'Mobile' : 'Desktop'} SERP page ${page} fetch failed: ${e.message}`);
-            break;
-        }
-        const $ = cheerio.load(html);
+    // stop if enough
+    if (pushedDetails >= results_wanted) return;
 
-        const byDom = discoverJKsFromDom($, base);
-        const byMosaic = discoverJKsFromMosaic(html);
-        const byRegex = discoverJKsByRegex(html);
-
-        const before = foundJKs.size;
-        for (const jk of [...byDom, ...byMosaic, ...byRegex]) foundJKs.add(jk);
-        const gained = foundJKs.size - before;
-
-        log.info(`${mobile ? 'Mobile' : 'Desktop'} SERP page ${page}: DOM=${byDom.length}, Mosaic=${byMosaic.length}, Regex=${byRegex.length}, gained=${gained}, total=${foundJKs.size}`);
-
-        // pagination
-        let nextUrl;
-        // Try standard pagination buttons
+    // paginate
+    if (page + 1 < maxPages) {
+        // Prefer explicit "Next" if present
         const nextHref = $('a[aria-label="Next"], a[rel="next"], a[data-testid="pagination-page-next"]').attr('href');
+        let nextUrl;
         if (nextHref) nextUrl = new URL(nextHref, base).href;
         else {
-            // fallback to start param
-            const u = new URL(url.href);
+            const u = new URL(request.url);
             const start = parseInt(u.searchParams.get('start') || '0', 10);
             u.searchParams.set('start', String(start + 10));
             nextUrl = u.href;
         }
-        if (!nextUrl || nextUrl === url.href) break;
-        url = new URL(nextUrl);
-    }
-    return uniqueDetailTargets(Array.from(foundJKs).slice(0, wanted), mobile ? base.replace('www.', 'm.') : 'https://m.' + base.split('://')[1], base);
-}
-
-// ----- discovery: RSS (last resort) -----
-async function discoverRss({ desktopBase, keyword, location, fromage, proxyConfig, wanted }) {
-    const found = [];
-    const rss = new URL('/rss', desktopBase);
-    if (keyword)  rss.searchParams.set('q', keyword);
-    if (location) rss.searchParams.set('l', location);
-    if (fromage)  rss.searchParams.set('fromage', fromage);
-
-    for (let i = 0; i < 5 && found.length === 0; i++) {
-        try {
-            await pace();
-            const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : undefined;
-            const res = await gotScraping({
-                url: rss.href,
-                headers: { 'accept': 'application/rss+xml, application/xml;q=0.9,*/*;q=0.8' },
-                headerGeneratorOptions: {
-                    browsers: [{ name: 'chrome', minVersion: 118 }],
-                    devices: ['desktop'],
-                    operatingSystems: ['windows', 'macos'],
-                },
-                proxyUrl,
-                http2: false,
-                timeout: { request: 45000 },
-                throwHttpErrors: false,
-            });
-            if (res.statusCode >= 500 || res.statusCode === 429) continue;
-            if (res.statusCode >= 400) break;
-
-            const $x = cheerio.load(res.body || '', { xmlMode: true });
-            $x('item').each((_, el) => {
-                if (found.length >= wanted) return;
-                const $el = $x(el);
-                const link = $el.find('link').text();
-                const titleRaw = norm($el.find('title').text());
-                const pubDate = norm($el.find('pubDate').text());
-                const jk = jkFrom(link, desktopBase);
-                if (!jk) return;
-
-                const parts = titleRaw.split(' - ').map(norm).filter(Boolean);
-                const seed = {
-                    title: parts[0] || titleRaw || null,
-                    company: parts.length >= 2 ? parts[parts.length - 2] : null,
-                    location: parts.length >= 3 ? parts[parts.length - 1] : null,
-                    date_posted: pubDate || null,
-                };
-                found.push({ url: `${desktopBase.replace('www.', 'm.')}/viewjob?jk=${jk}`, seed });
-            });
-        } catch { /* retry loop */ }
-    }
-    return found;
-}
-
-// ----- process one job detail (mobile-first, desktop fallback if thin) -----
-async function fetchJob(detail, proxyConfig, mobileBase, desktopBase) {
-    const { url, seed } = detail;
-    const getJK = () => jkFrom(url, mobileBase) || url.match(/[?&]jk=([a-z0-9]+)/i)?.[1];
-
-    let htmlMobile;
-    try {
-        htmlMobile = await fetchHtml(url, { proxyConfig, mobile: true, attempts: 4 });
-    } catch (e) {
-        try {
-            const jk = getJK();
-            if (!jk) throw e;
-            const htmlDesk = await fetchHtml(`${desktopBase}/viewjob?jk=${jk}`, { proxyConfig, mobile: false, attempts: 4 });
-            const $d = cheerio.load(htmlDesk);
-            const res = extractDetail($d, url, seed);
-            await Actor.pushData(res);
-            return true;
-        } catch (e2) {
-            log.warning(`Detail failed: ${url} — ${e2.message}`);
-            return false;
+        if (nextUrl && nextUrl !== request.url) {
+            await rq.addRequest({ url: nextUrl, userData: { label: 'LIST', mobile, page: page + 1 } });
+            pageCount++;
+        } else if (mobile) {
+            // Switch to DESKTOP SERP if mobile has no next
+            const du = new URL('/jobs', DESKTOP);
+            if (keyword)  du.searchParams.set('q', keyword);
+            if (location) du.searchParams.set('l', location);
+            if (fromage)  du.searchParams.set('fromage', fromage);
+            du.searchParams.set('filter', '0');
+            du.searchParams.set('radius', '25');
+            await rq.addRequest({ url: du.href, userData: { label: 'LIST', mobile: false, page: 0 } });
         }
+    } else if (mobile) {
+        // hit desktop after mobile maxPages
+        const du = new URL('/jobs', DESKTOP);
+        if (keyword)  du.searchParams.set('q', keyword);
+        if (location) du.searchParams.set('l', location);
+        if (fromage)  du.searchParams.set('fromage', fromage);
+        du.searchParams.set('filter', '0');
+        du.searchParams.set('radius', '25');
+        await rq.addRequest({ url: du.href, userData: { label: 'LIST', mobile: false, page: 0 } });
+    }
+});
+
+// DETAIL handler: extract; fallback to desktop if thin
+router.addHandler('DETAIL', async (ctx) => {
+    const { request, $, body, response, session, log: clog } = ctx;
+    const { jk, triedDesktop, seed } = request.userData || {};
+
+    const status = response?.statusCode || response?.status;
+    if (status === 403 || status === 429) {
+        clog.warning(`Detail blocked ${status} — ${request.url}`);
+        session?.markBad?.();
+        throw new Error(`Blocked ${status}`);
+    }
+    if (status >= 500) {
+        session?.markBad?.();
+        throw new Error(`Upstream ${status}`);
+    }
+    if (!body || body.length < 100) throw new Error('Thin detail body');
+
+    const hasDesc = $('#jobDescriptionText, #jobDescriptionTextContainer').length > 0 || norm($.root().text()).length > 150;
+    if (!hasDesc && !triedDesktop && jk) {
+        // re-queue desktop detail
+        const du = `${DESKTOP}/viewjob?jk=${jk}`;
+        await ctx.crawler.requestQueue.addRequest({
+            url: du,
+            userData: { label: 'DETAIL', jk, triedDesktop: true, seed },
+        });
+        return;
     }
 
-    let $ = cheerio.load(htmlMobile);
-    const thin = !$('#jobDescriptionText, #jobDescriptionTextContainer').length && $.root().text().trim().length < 80;
-    if (thin) {
-        try {
-            const jk = getJK();
-            if (jk) {
-                const htmlDesk = await fetchHtml(`${desktopBase}/viewjob?jk=${jk}`, { proxyConfig, mobile: false, attempts: 3 });
-                $ = cheerio.load(htmlDesk);
-            }
-        } catch { /* keep mobile */ }
-    }
+    const item = extractDetail($, request.url, seed);
+    await Dataset.pushData(item);
+});
 
-    const res = extractDetail($, url, seed);
-    await Actor.pushData(res);
-    return true;
-}
-
-// ----------- MAIN -----------
-await Actor.init();
-const input = (await Actor.getInput()) || {};
-const {
-    keyword = 'office',
-    location = 'United States',
-    postedWithin = '7d',          // '24h'|'7d'|'30d'
-    results_wanted = 50,
-    maxConcurrency = 2,
-    proxyConfiguration = null,
-    indeedDomain = 'www.indeed.com'  // allow overrides like 'ca.indeed.com', 'uk.indeed.com'
-} = input;
-
+// ----------------- crawler -----------------
 const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
-const fromage = DATE_MAP[postedWithin] || '7';
 
-const DESKTOP = `https://${indeedDomain}`;
-const MOBILE  = indeedDomain.startsWith('m.') ? `https://${indeedDomain}` : `https://m.${indeedDomain.replace(/^www\./, '')}`;
+const crawler = new CheerioCrawler({
+    requestQueue: rq,
+    proxyConfiguration: proxyConfig,
+    useSessionPool: true,
+    // keep these within supported HttpCrawlerOptions
+    maxConcurrency: Math.max(1, Number(maxConcurrency) || 2),
+    requestHandler: router,
+    navigationTimeoutSecs: 60,
+    requestHandlerTimeoutSecs: 120,
+    maxRequestRetries: 3,
+    // gentle pacing + realistic headers
+    preNavigationHooks: [
+        async ({ request }) => {
+            const isMobile = request.url.startsWith(MOBILE);
+            request.headers = {
+                ...request.headers,
+                'user-agent': pickUA(isMobile),
+                'accept-language': 'en-US,en;q=0.9',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'upgrade-insecure-requests': '1',
+                'referer': 'https://www.google.com/',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+                'connection': 'close',
+            };
+            // Small randomized delay to reduce burstiness
+            const jitter = 500 + Math.floor(Math.random() * 900);
+            await Actor.sleep(jitter);
+        },
+    ],
+    failedRequestHandler: async ({ request, error, log: clog }) => {
+        clog.warning(`Failed after retries: ${request.url} — ${error?.message || error}`);
+    },
+});
 
-log.info(`Indeed discovery: "${keyword}" in "${location}" (${postedWithin}) on ${indeedDomain}`);
+log.info(`Indeed: "${keyword}" in "${location}" within ${postedWithin} on ${indeedDomain}`);
+await crawler.run();
 
-// 1) Mobile SERP with triple extract
-let targets = await discoverSerp({ base: MOBILE, mobile: true, keyword, location, fromage, proxyConfig, wanted: results_wanted, maxPages: 40 });
-
-if (!targets.length) {
-    log.warning('Mobile SERP yielded 0 — trying Desktop SERP with triple extract…');
-    targets = await discoverSerp({ base: DESKTOP, mobile: false, keyword, location, fromage, proxyConfig, wanted: results_wanted, maxPages: 40 });
+// Safety net: if nothing was pushed, tell the logs but exit 0 (actor succeeds, dataset may be empty)
+const info = await Dataset.getInfo();
+if (!info?.itemCount) {
+    log.error('No jobs discovered. Check proxy country (US), domain (www.indeed.com), and try smaller concurrency (1).');
 }
 
-if (!targets.length) {
-    log.warning('Desktop SERP yielded 0 — trying RSS…');
-    targets = await discoverRss({ desktopBase: DESKTOP, keyword, location, fromage, proxyConfig, wanted: results_wanted });
-}
-
-if (!targets.length) {
-    log.error('No jobs discovered after all strategies. Check proxies, domain, and inputs.');
-    await Actor.exit();
-}
-
-// trim to requested count
-targets = targets.slice(0, results_wanted);
-
-// simple worker pool
-async function runPool(items, worker, concurrency) {
-    const queue = items.slice();
-    const workers = Array.from({ length: concurrency }, async () => {
-        while (queue.length) {
-            const item = queue.shift();
-            try { await worker(item); }
-            catch (e) { /* already logged */ }
-        }
-    });
-    await Promise.all(workers);
-}
-
-await runPool(
-    targets,
-    (it) => fetchJob(it, proxyConfig, MOBILE, DESKTOP),
-    Math.max(1, Number(maxConcurrency) || 2)
-);
-
-log.info(`Done. Attempted ${targets.length} details.`);
 await Actor.exit();
