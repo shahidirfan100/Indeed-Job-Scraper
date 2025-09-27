@@ -1,6 +1,7 @@
 import { Actor } from 'apify';
 import { CheerioCrawler, Dataset, log } from 'crawlee';
 import * as cheerio from 'cheerio';
+import { gotScraping } from 'got-scraping';
 
 // ——— CONSTANTS ———
 const BASE_URL = 'https://www.indeed.com';
@@ -45,14 +46,14 @@ const {
     posted_date = 'anytime',    // 'anytime' | '24h' | '7d' | '30d'
     max_pages = 5,
     max_items = 200,
-    proxyConfiguration,         // unchanged: wired to Apify proxies via input schema
+    proxyConfiguration,         // unchanged; driven by your input schema
 } = input;
 
 if (!keyword || !keyword.trim()) {
     throw new Error('Input "keyword" is required.');
 }
 
-// Build initial search URL (consistent with your runs)
+// Build initial search URL
 const startUrl = new URL('/jobs', BASE_URL);
 startUrl.searchParams.set('q', keyword);
 if (location) startUrl.searchParams.set('l', location);
@@ -60,51 +61,39 @@ if (posted_date !== 'anytime' && DATE_POSTED_MAP[posted_date]) {
     startUrl.searchParams.set('fromage', DATE_POSTED_MAP[posted_date]);
 }
 
-// Counters
 let itemCount = 0;
 let pageCount = 0;
 
-// Crawler (Crawlee 3.x–compatible)
 const crawler = new CheerioCrawler({
     useSessionPool: true,
     persistCookiesPerSession: true,
     proxyConfiguration: await Actor.createProxyConfiguration?.(proxyConfiguration),
 
-    // Gentle defaults; raise once stable
     maxConcurrency: 2,
-    minConcurrency: 1,
     maxRequestRetries: 3,
     requestHandlerTimeoutSecs: 60,
 
-    // Header generator (supported by Crawlee 3.x)
-    headerGeneratorOptions: {
-        browsers: [
-            { name: 'chrome', minVersion: 120, maxVersion: 124 },
-            { name: 'firefox', minVersion: 120, maxVersion: 124 },
-            { name: 'safari', minVersion: 17, maxVersion: 17 },
-        ],
-        devices: ['desktop'],
-        operatingSystems: ['windows', 'macos', 'linux'],
-    },
-
-    // Supported: set headers before each request + small randomized delay
+    // Supported way in CheerioCrawler 3.x: modify got (HTTP client) options here
+    // (see docs/examples). We'll set headers and add a small jitter. :contentReference[oaicite:2]{index=2}
     preNavigationHooks: [
-        async ({ request, session }) => {
+        async (ctx, gotOptions) => {
+            const { session } = ctx;
             const ua = session?.userData?.ua || randomDesktopUA();
             if (session && !session.userData.ua) session.userData.ua = ua;
 
-            request.headers = {
-                ...request.headers,
+            gotOptions.headers = {
+                ...(gotOptions.headers || {}),
                 'User-Agent': ua,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
                 'Upgrade-Insecure-Requests': '1',
-                'Referer': 'https://www.google.com/', // helps on list pages
+                // a benign referrer helps on list pages
+                'Referer': 'https://www.google.com/',
             };
 
-            // jitter between 800–2200ms to soften bursts
+            // Gentle jitter (800–2200ms) between requests to reduce rate-based blocks
             const sleepMs = 800 + Math.floor(Math.random() * 1400);
             await Actor.sleep(sleepMs);
         },
@@ -114,7 +103,7 @@ const crawler = new CheerioCrawler({
         const { request, $, response, session, log, crawler } = ctx;
         const { label } = request.userData || {};
 
-        // Early block detection (compatible API)
+        // Early block detection (compatible with Crawlee 3.x)
         const status = response?.statusCode ?? response?.status;
         if (status === 403 || status === 429) {
             log.warning(`Blocked with status ${status} on ${request.url}. Marking session bad.`);
@@ -139,8 +128,7 @@ const crawler = new CheerioCrawler({
             $('a.tapItem[href], a[data-jk][href]').each((_, el) => {
                 const href = $(el).attr('href');
                 if (!href) return;
-                // Skip Google ads/sponsored redirects if present
-                if (/^https?:\/\/(www\.)?google\./i.test(href)) return;
+                if (/^https?:\/\/(www\.)?google\./i.test(href)) return; // skip ad redirects
                 const abs = new URL(href, BASE_URL).href;
                 jobLinks.push(abs);
             });
@@ -150,7 +138,7 @@ const crawler = new CheerioCrawler({
                 await crawler.addRequests([{ url, userData: { label: 'DETAIL' } }]);
             }
 
-            // Pagination: prefer explicit "Next", otherwise bump ?start= by 10
+            // Pagination (prefer "Next", else bump ?start= by 10)
             if (pageCount < max_pages && itemCount < max_items) {
                 const nextSel = 'a[aria-label="Next"], a[data-testid="pagination-page-next"]';
                 const nextHref = $(nextSel).attr('href');
@@ -166,10 +154,20 @@ const crawler = new CheerioCrawler({
             }
 
         } else {
-            // DETAIL PAGE — ensure we have HTML ($). If not, fetch via Crawlee's client.
+            // DETAIL PAGE — if $ missing, fetch via got-scraping (same headers via UA)
             let $$ = $;
             if (!$$) {
-                const resp = await ctx.sendRequest({ url: request.url, responseType: 'text' });
+                const ua = session?.userData?.ua || randomDesktopUA();
+                const resp = await gotScraping({
+                    url: request.url,
+                    headers: {
+                        'User-Agent': ua,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Referer': 'https://www.google.com/',
+                    },
+                });
                 if (resp.statusCode === 403 || resp.statusCode === 429) {
                     session?.markBad();
                     throw new Error(`Blocked ${resp.statusCode} on detail fetch`);
@@ -177,7 +175,7 @@ const crawler = new CheerioCrawler({
                 $$ = cheerio.load(resp.body);
             }
 
-            // ——— Field extraction with robust fallbacks ———
+            // ——— Field extraction ———
             const title = pickText($$, [
                 'h1[data-testid="jobsearch-JobTitle"]',
                 'h1.jobsearch-JobInfoHeader-title',
@@ -223,7 +221,7 @@ const crawler = new CheerioCrawler({
                     .next()
                     .find('li')
                     .each((_, li) => types.add(norm($$(li).text())));
-                // Fallback: scan for common tokens
+                // Fallback token scan
                 $$('li').each((_, li) => {
                     const t = norm($$(li).text());
                     if (/full[-\s]?time|part[-\s]?time|contract|temporary|internship|commission|per[-\s]?diem|apprenticeship|remote/i.test(t)) {
